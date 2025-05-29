@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Option Chain Data</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="container">
+    <h1>Option Chain Viewer</h1>
+    <label for="expiry">Select Expiry Date:</label>
+    <input type="date" id="expiry" />
+    <button onclick="fetchData()">Start Fetching</button>
+
+    <pre id="dataDisplay"></pre>
+  </div>
+
+  <script>
+    async function fetchData() {
+      const expiryDate = document.getElementById("expiry").value;
+      const accessToken = localStorage.getItem("accessToken");
+
+      const res = await fetch(`/option-chain?accessToken=${accessToken}&expiryDate=${expiryDate}`);
+      const data = await res.json();
+
+      document.getElementById("dataDisplay").innerText = JSON.stringify(data, null, 2);
+    }
+  </script>
+</body>
+</html>
