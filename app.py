@@ -1,120 +1,96 @@
-from flask import Flask, request, jsonify, send_from_directory
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import httpx
 import sqlite3
-import requests
-from flask_cors import CORS
-import os
+from datetime import datetime, timedelta
 
-app = Flask(__name__, static_folder='public')
-CORS(app)  # enable CORS
+app = FastAPI()
 
-DB_PATH = 'database.sqlite'
+DB_FILE = "data.db"
 
-# Initialize database and create table if not exists
+CLIENT_ID = "2f86a5b5-bef6-4c1a-9ce6-1753df6c0f6b"
+CLIENT_SECRET = "yw71gnmh3g"
+REDIRECT_URI = "https://www.google.co.in/"
+
+# Initialize DB and tables if not exist
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS tokens (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            access_token TEXT NOT NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS access_token (
+            id INTEGER PRIMARY KEY,
+            token TEXT,
+            expires_at TEXT
         )
-    ''')
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS option_chain_data (
+            id INTEGER PRIMARY KEY,
+            timestamp TEXT,
+            raw_data TEXT,
+            calculated_data TEXT
+        )
+    """)
     conn.commit()
     conn.close()
 
 init_db()
 
-CLIENT_ID = "2f86a5b5-bef6-4c1a-9ce6-1753df6c0f6b"
-CLIENT_SECRET = "yw71gnmh3g"
-REDIRECT_URI = "https://www.google.co.in/"  # As per your setup
+class AuthCode(BaseModel):
+    auth_code: str
 
-# Serve index.html and other static files
-@app.route('/')
-def serve_index():
-    return send_from_directory(app.static_folder, 'index.html')
-
-@app.route('/login', methods=['GET'])
-def login():
-    # Manual auth code paste approach - frontend handles this
-    auth_url = f"https://api.upstox.com/v2/login/authorization/dialog?response_type=code&client_id={CLIENT_ID}&redirect_uri={REDIRECT_URI}"
-    return jsonify({"auth_url": auth_url})
-
-@app.route('/generate-token', methods=['POST'])
-def generate_token():
-    data = request.get_json()
-    auth_code = data.get('authCode')
-
-    if not auth_code:
-        return jsonify({"error": "Authorization code is required"}), 400
-
-    token_url = "https://api.upstox.com/v2/login/authorization/token"
+@app.post("/auth/code")
+async def exchange_auth_code(data: AuthCode):
+    # Exchange auth code for access token from Upstox
+    url = "https://api.upstox.com/v2/login/authorization/token"
     params = {
-        'code': auth_code,
-        'client_id': CLIENT_ID,
-        'client_secret': CLIENT_SECRET,
-        'redirect_uri': REDIRECT_URI,
-        'grant_type': 'authorization_code'
+        "code": data.auth_code,
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "redirect_uri": REDIRECT_URI,
+        "grant_type": "authorization_code"
     }
-    headers = {
-        'Content-Type': 'application/x-www-form-urlencoded'
-    }
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
 
-    try:
-        resp = requests.post(token_url, params=params, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
-        access_token = data.get('access_token')
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(url, params=params, headers=headers)
+    
+    if resp.status_code != 200:
+        raise HTTPException(status_code=400, detail="Failed to exchange auth code")
 
-        if not access_token:
-            return jsonify({"error": "Failed to get access token"}), 500
+    resp_json = resp.json()
+    access_token = resp_json.get("access_token")
+    expires_in = resp_json.get("expires_in")  # usually in seconds
 
-        # Save access token to DB
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("INSERT INTO tokens (access_token) VALUES (?)", (access_token,))
-        conn.commit()
-        conn.close()
+    if not access_token or not expires_in:
+        raise HTTPException(status_code=400, detail="Invalid response from Upstox")
 
-        return jsonify({"accessToken": access_token})
+    expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
 
-    except requests.RequestException as e:
-        return jsonify({"error": str(e)}), 500
+    # Save token to DB (replace old token if exists)
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM access_token")
+    c.execute("INSERT INTO access_token (token, expires_at) VALUES (?, ?)", (access_token, expires_at.isoformat()))
+    conn.commit()
+    conn.close()
 
-@app.route('/option-chain', methods=['GET'])
-def option_chain():
-    expiry_date = request.args.get('expiryDate')
-    if not expiry_date:
-        return jsonify({"error": "expiryDate parameter is required"}), 400
+    return {"access_token": access_token, "expires_at": expires_at.isoformat()}
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT access_token FROM tokens ORDER BY created_at DESC LIMIT 1")
-    row = cursor.fetchone()
+@app.get("/auth/token")
+def get_access_token():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT token, expires_at FROM access_token ORDER BY id DESC LIMIT 1")
+    row = c.fetchone()
     conn.close()
 
     if not row:
-        return jsonify({"error": "No access token found. Please login first."}), 400
+        raise HTTPException(status_code=404, detail="No access token found. Please login.")
 
-    access_token = row[0]
+    token, expires_at_str = row
+    expires_at = datetime.fromisoformat(expires_at_str)
+    if datetime.utcnow() >= expires_at:
+        raise HTTPException(status_code=401, detail="Access token expired. Please login again.")
 
-    url = "https://api.upstox.com/v2/option/chain"
-    params = {
-        'mode': 'option_chain',
-        'instrument_key': 'NSE_INDEX|Nifty 50',
-        'expiry_date': expiry_date
-    }
-    headers = {
-        'Accept': 'application/json',
-        'Authorization': f'Bearer {access_token}'
-    }
-
-    try:
-        resp = requests.get(url, params=params, headers=headers)
-        resp.raise_for_status()
-        return jsonify(resp.json())
-    except requests.RequestException as e:
-        return jsonify({"error": str(e)}), 500
-
-if __name__ == '__main__':
-    app.run(debug=True, port=3000)
+    return {"access_token": token, "expires_at": expires_at_str}
